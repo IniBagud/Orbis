@@ -1,0 +1,3 @@
+build/bin/ffmpeg.exe
+build/bin/magick.exe
+build/bin/pandoc.exe

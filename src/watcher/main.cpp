@@ -4,17 +4,75 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <sstream>
 
-// Daftar aplikasi yang diizinkan memicu Orbis (gunakan huruf kecil)
 const std::vector<std::wstring> TARGET_PROCESSES = {
     L"explorer.exe",
+    L"chrome.exe",
+    L"msedge.exe"
 };
+
+const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\OrbisPipe";
+const wchar_t* CONVERTER_MUTEX = L"Orbis_Converter_Mutex";
+constexpr UINT WM_APP_TRIGGER = WM_APP + 1;
+constexpr UINT WM_APP_FOCUS   = WM_APP + 2;
 
 bool g_isTargetAppFocused = false;
 HHOOK g_mouseHook = NULL;
 HWINEVENTHOOK g_winEventHook = NULL;
+DWORD g_mainThreadId = 0;
 
-// Mengecek apakah jendela yang sedang aktif termasuk dalam daftar TARGET_PROCESSES
+// Mengecek apakah OrbisConverter.exe sudah berjalan
+bool IsConverterRunning() {
+    HANDLE hMutex = OpenMutexW(SYNCHRONIZE, FALSE, CONVERTER_MUTEX);
+    if (hMutex) {
+        CloseHandle(hMutex);
+        return true;
+    }
+    return false;
+}
+
+// Meluncurkan OrbisConverter.exe dari folder yang sama dengan OrbisWatcher.exe
+bool EnsureConverterRunning() {
+    if (IsConverterRunning()) return true;
+
+    wchar_t watcherPath[MAX_PATH];
+    GetModuleFileNameW(NULL, watcherPath, MAX_PATH);
+    std::wstring dir(watcherPath);
+    size_t lastSlash = dir.find_last_of(L"\\/");
+    std::wstring converterPath = dir.substr(0, lastSlash + 1) + L"OrbisConverter.exe";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    if (CreateProcessW(converterPath.c_str(), NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        std::wcout << L"[WATCHER] Meluncurkan OrbisConverter.exe...\n";
+        WaitNamedPipeW(PIPE_NAME, 1500); // Tunggu maksimal 1.5 detik sampai pipe siap
+        return true;
+    }
+
+    std::wcerr << L"[WATCHER] Gagal meluncurkan OrbisConverter.exe!\n";
+    return false;
+}
+
+// Mengirim pesan teks singkat ke OrbisConverter.exe via Named Pipe
+void SendPipeMessage(const std::string& message) {
+    if (!EnsureConverterRunning()) return;
+
+    HANDLE hPipe = CreateFileW(
+        PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL
+    );
+
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        DWORD bytesWritten = 0;
+        WriteFile(hPipe, message.c_str(), static_cast<DWORD>(message.size()), &bytesWritten, NULL);
+        CloseHandle(hPipe);
+    }
+}
+
 bool CheckForegroundProcess(HWND hwnd) {
     if (!hwnd) return false;
 
@@ -33,7 +91,6 @@ bool CheckForegroundProcess(HWND hwnd) {
         std::wstring fullPath(processPath);
         size_t lastSlash = fullPath.find_last_of(L"\\/");
         std::wstring exeName = (lastSlash != std::wstring::npos) ? fullPath.substr(lastSlash + 1) : fullPath;
-
         std::transform(exeName.begin(), exeName.end(), exeName.begin(), ::towlower);
 
         for (const auto& target : TARGET_PROCESSES) {
@@ -48,7 +105,6 @@ bool CheckForegroundProcess(HWND hwnd) {
     return isMatch;
 }
 
-// Dipanggil otomatis oleh Windows setiap kali user berpindah jendela aktif
 void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd,
                            LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (event == EVENT_SYSTEM_FOREGROUND) {
@@ -56,28 +112,28 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd,
         g_isTargetAppFocused = CheckForegroundProcess(hwnd);
 
         if (g_isTargetAppFocused && !wasFocused) {
-            std::wcout << L"[FOCUS] Aplikasi target AKTIF -> Menyiagakan OrbisConverter...\n";
-            // Fase berikutnya: Jalankan/bangunkan OrbisConverter.exe di latar belakang
+            std::wcout << L"[WATCHER] Masuk mode fokus -> Membangunkan OrbisConverter.\n";
+            PostThreadMessageW(g_mainThreadId, WM_APP_FOCUS, 0, 0);
         } else if (!g_isTargetAppFocused && wasFocused) {
-            std::wcout << L"[FOCUS] Keluar dari aplikasi target -> Timer idle 2 menit dimulai.\n";
+            std::wcout << L"[WATCHER] Keluar mode fokus.\n";
         }
     }
 }
 
-// Menangkap kombinasi Shift + Middle Click saat aplikasi target aktif
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && g_isTargetAppFocused) {
         if (wParam == WM_MBUTTONDOWN) {
             bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-
             if (isShiftPressed) {
-                MSLLHOOKSTRUCT* pMouse = (MSLLHOOKSTRUCT*)lParam;
-                std::wcout << L"[TRIGGER] Shift + Middle Click pada koordinat: ("
-                           << pMouse->pt.x << L", " << pMouse->pt.y << L")\n";
+                MSLLHOOKSTRUCT* pMouse = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+                HWND fgHwnd = GetForegroundWindow();
 
-                // Fase berikutnya: Kirim perintah "SHOW_MENU" beserta koordinat via Named Pipe
-
-                // Return 1 menelan event klik agar tidak memicu aksi bawaan Windows
+                // Kirim ke message loop utama agar hook mouse tidak pernah lag
+                PostThreadMessageW(
+                    g_mainThreadId, WM_APP_TRIGGER,
+                    reinterpret_cast<WPARAM>(fgHwnd),
+                    MAKELPARAM(pMouse->pt.x, pMouse->pt.y)
+                );
                 return 1;
             }
         }
@@ -86,38 +142,43 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 int main() {
-    std::wcout << L"========================================\n";
-    std::wcout << L"   ORBIS WATCHER - FASE 1 (DEBUG MODE)  \n";
-    std::wcout << L"========================================\n";
-    std::wcout << L"Instruksi uji coba:\n";
-    std::wcout << L"1. Buka File Explorer.\n";
-    std::wcout << L"2. Tekan Shift + Middle Click di area Explorer.\n";
-    std::wcout << L"3. Tekan Ctrl + C di terminal ini untuk keluar.\n\n";
+    g_mainThreadId = GetCurrentThreadId();
+    std::wcout << L"=== ORBIS WATCHER ===\n";
 
-    // Cek status jendela aktif saat program baru saja dimulai
     g_isTargetAppFocused = CheckForegroundProcess(GetForegroundWindow());
     if (g_isTargetAppFocused) {
-        std::wcout << L"[FOCUS] Aplikasi target sudah aktif sejak awal.\n";
+        SendPipeMessage("FOCUS");
     }
 
-    // Pasang Event Hook perpindahan fokus jendela
     g_winEventHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         NULL, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
-
-    // Pasang Low-Level Mouse Hook
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandle(NULL), 0);
 
     if (!g_winEventHook || !g_mouseHook) {
-        std::wcerr << L"[FATAL] Gagal memasang Windows Hook!\n";
+        std::wcerr << L"[WATCHER] Gagal memasang Windows Hook!\n";
         return 1;
     }
 
-    // Message loop standar Windows
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.hwnd == NULL) {
+            if (msg.message == WM_APP_FOCUS) {
+                SendPipeMessage("FOCUS");
+                continue;
+            } else if (msg.message == WM_APP_TRIGGER) {
+                int x = static_cast<short>(LOWORD(msg.lParam));
+                int y = static_cast<short>(HIWORD(msg.lParam));
+                uintptr_t hwndVal = reinterpret_cast<uintptr_t>(msg.wParam);
+
+                std::ostringstream oss;
+                oss << "SHOW " << x << " " << y << " " << hwndVal;
+                SendPipeMessage(oss.str());
+                continue;
+            }
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
